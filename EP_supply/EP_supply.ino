@@ -6,12 +6,30 @@
 // Volteq licenses to you the right to use, modify, and copy
 // only for use in a Volteq product.
 
+// external 15-pin interface connector
+//   pin 1  - MOSI
+//       2  - MISO
+//       3  - SS
+//       4  - SCK
+//       5  - 
+//       6  - +5V
+//       7  - +12V
+//       8  - GND (Main supply output negative)
+//       9  - D4  (polarity relay in sample firmware)
+//      10  - IO13
+//      11  - IO12/A11
+//      12  - D5
+//      13  - D6/A7
+//      14  - RX
+//      15  - TX
+
+
 #include <EEPROM.h>
 #include <Wire.h>
 #include <LCD.h>
 #include <LiquidCrystal_I2C.h>
 
-
+// LCD display using PCF8574 IO extender; pin assignments on extender chip defined here
 #define I2C_ADDR  0x27 // <<- Add your address here.  0x3F for test unit; 0x27 for production
 #define Rs_pin 0
 #define Rw_pin 1
@@ -32,9 +50,9 @@ const uint8_t  pushButton = A5; //this pin reads the input value of all the push
 const uint8_t  powerStatusPin = A4;
 const uint8_t  potPin = A0; //this is the big adjustment pot in the front
 const uint8_t outputPin[4] = {10, 9, 11, 7};  //pin 10 for I, pin 9 for V, Pin 11 for OVP, pin 7 for Enable/Disable
-const uint8_t readPin[3] = {A1, A2, A3};
+const uint8_t readPin[3] = {A1, A2, A3};  // A1 I sense; A2 V sense; A3 remote in
 
-#define sbi(x, y)  (x |= (1 << y))   /*Shift Register x position y*/
+
 
 const uint8_t rpControlPin = 4;             //reverse polarity control pin, this is to be used with the reverse polarity box
 uint8_t  rpDirection = 0 ;  //0 is reverse, 1 is normal
