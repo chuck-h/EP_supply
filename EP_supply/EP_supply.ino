@@ -1,3 +1,5 @@
+#include <HID.h>
+
 // Control code for two-channel electrophoresis supply using Volteq HY30005EP supply and
 //  external relay box.
 
@@ -47,8 +49,8 @@
 #define RS485Pin 8
 LiquidCrystal_I2C lcd(I2C_ADDR, En_pin, Rw_pin, Rs_pin, D4_pin, D5_pin, D6_pin, D7_pin);
 
-typedef enum {AmpCmd, VoltCmd, OVoltCmd, EnableOut, NUM_OUT_PINS} OutPinType;
-const uint8_t outputPin[NUM_OUT_PINS] = {10, 9, 11, 7};  //pin 10 for I, pin 9 for V, Pin 11 for OVP, pin 7 for Enable/Disable
+typedef enum                          {AmpCmd, VoltCmd, OVoltCmd, EnableOut, NSOut, EWOut, NUM_OUT_PINS} OutPinType;
+const uint8_t outputPin[NUM_OUT_PINS] = {10,      9,       11,        7,        5,     6 }; 
 
 /* Configure digital pins 9 and 10 as 16-bit PWM OutputStatuss. */
 void setupPWM16() {
@@ -73,29 +75,44 @@ void analogWrite16(uint8_t pin, uint16_t val) //Control function for PWM 9 & 10
 
 enum UiScreen {MainScreen, SetupScreen, ParamScreen} uiScreen;
 
-enum {OffMode, StartMode, WaitNSMode, WaitEWMode, NSMode, EWMode, TOTAL_MODES} cmailMode;
-char modeCode[TOTAL_MODES][3] = {"--", "--", "..", "..", "NS", "EW"};
+enum {OffMode, StartMode, AmpZeroMode, WaitNSMode, WaitEWMode, NSMode, EWMode, TOTAL_MODES} cmailMode;
+char modeCode[TOTAL_MODES][3] = {"--", "--", "az", "..", "..", "NS", "EW"};
 
 // Analog input & processing
 const unsigned long analogReadInterval = 50; // millisec between analog updates
-typedef enum  { NoProc, PotProc, Discrete0, Discrete1, Linearize0, Linearize1 } ProcessType;
+typedef enum  { NoProc, PotProc, Discrete, SlopeIntercept } ProcessType;
 typedef enum              {PotChan=0, KeysChan, StatusChan, VoltsChan, AmpsChan, RemoteChan, ANALOG_CHANS} AnalogChan;
 const uint8_t analogPin[] = { A0,      A5,        A4,        A2,         A1,       A3 };
 const float   smoothingK[]= { 0.5,     0.5,       0.5,       0.1,        0.1,      0.1};
-const int8_t  processVal[]= { PotProc,Discrete0,Discrete1,Linearize0,Linearize1,Linearize0};
+const int8_t  processVal[]= { PotProc,Discrete,Discrete,SlopeIntercept,SlopeIntercept,SlopeIntercept};
 float    analogSmoothed[ANALOG_CHANS];
 float    analogProcessed[ANALOG_CHANS];
 
-const int numDiscretes = 2; // Keys, Status
-int discreteValue[numDiscretes];
+typedef enum { KeysDiscr, StatusDiscr, NUM_DISCRETES } DiscreteType;
+int discreteValue[NUM_DISCRETES];
 
+typedef enum     {VoltsSI, AmpsSI, RemoteSI, NUM_SLOPE_INTERCEPTS } SIType;
+struct SIParameters {
+  float slope, intercept;
+  AnalogChan chan;
+};
+struct SIParameters siParameters[NUM_SLOPE_INTERCEPTS] = {
+  {0.305, 0., VoltsChan}, { 0.0055, -0.29, AmpsChan}, {0.305, 0., RemoteChan} }; 
 
-// CMAIL parameters
-float cmailV1, cmailV2;
-unsigned int cmailT1, cmailT2, cmailCycles;
-// temporary CMAIL parametersused in adjustment screen
-float cmailV1_tmp, cmailV2_tmp;
-unsigned int cmailT1_tmp, cmailT2_tmp, cmailCycles_tmp;
+typedef enum     {AmpsPWMCal, VoltsPWMCal, OVoltsPWMCal, NUM_CALS } CalType;
+const int CAL_COEFFS = 4;
+struct CalParameters {
+  float coeff[CAL_COEFFS];
+};
+struct CalParameters calParameters[NUM_CALS] = {
+  { { 0.0, 0.0, 65000./5., 3000. } }, { { 0.0, 0.0, 65000./300., 0.0 } }, { { 0.0, 0.0, 255./300., 0.0 }, } }; 
+
+struct CmailParameters {
+  float v1, v2;
+  unsigned int t1, t2, cycles;
+};
+struct CmailParameters cmailActive, cmailTemp;
+const int cmailEEPROMBase = 0;
 // CMAIL running values
 int cmailCycleNow, cmailSecRemain;
 bool cmailPause;
@@ -108,14 +125,13 @@ float setpointVolts;
 void setup()
 {
 
-  pinMode(outputPin[OVoltCmd], OUTPUT);  //PWM OV Control Pin
+  for (int p=0; p<NUM_OUT_PINS; ++p) {
+    pinMode(outputPin[p], OUTPUT);
+  }
   analogWrite(outputPin[OVoltCmd], 250); // set OV to maximum
   setupPWM16();
-  pinMode(outputPin[VoltCmd], OUTPUT);//PWM Voltage Control Pin
-  pinMode(outputPin[AmpCmd], OUTPUT);//PWM Current Control Pin
   analogWrite16(outputPin[VoltCmd], 0);
   analogWrite16(outputPin[AmpCmd], 0);
-  pinMode(outputPin[EnableOut], OUTPUT);//Output Enable/Disable
   digitalWrite(outputPin[EnableOut], LOW);//disable Output
 
   delay(300);
@@ -133,6 +149,11 @@ void setup()
   Serial.begin(19200);
   Serial1.begin(9600);
   delay(200);
+
+  uint8_t* p = (uint8_t*)&cmailActive;
+  for (int i=0; i<sizeof(cmailActive); ++i) {
+     *(p+i) = EEPROM.read(i+cmailEEPROMBase);
+  }
 
   cmailMode = OffMode;
   uiScreen = MainScreen;
@@ -158,14 +179,26 @@ void loop()
 
 }
 
+// polynomial calibration curve for PWM outputs
+float applyCal(float input, CalType c);
+float applyCal(float input, CalType c) {
+  CalParameters& cal = calParameters[c];
+  float rv = cal.coeff[0];
+  for (int i=1; i<CAL_COEFFS; ++i) {
+    rv = input*rv + cal.coeff[i]; 
+  }
+  return rv;
+}
+
 void updateOutputs() {
   digitalWrite(outputPin[EnableOut], (cmailMode==OffMode) ? LOW : HIGH);
-  const float voltsMax = 300., voltsMaxPWM = 65000.;
-  float voltPWM = setpointVolts/voltsMax * voltsMaxPWM;
+  digitalWrite(outputPin[NSOut], (cmailMode==NSMode) ? HIGH : LOW);
+  digitalWrite(outputPin[EWOut], (cmailMode==EWMode) ? HIGH : LOW);
+  float voltPWM = applyCal(setpointVolts, VoltsPWMCal);
   analogWrite16(outputPin[VoltCmd], (uint16_t)voltPWM);
   analogWrite(outputPin[OVoltCmd], 250);
-  const float ampsMax = 5., ampsMaxPWM = 65000., ampsZeroPWM = 3000.;
-  float ampPWM = 0.3/ampsMax * ampsMaxPWM + ampsZeroPWM;
+  const float ampsLimit=0.3;
+  float ampPWM = applyCal(ampsLimit, AmpsPWMCal);
   analogWrite16(outputPin[AmpCmd], (uint16_t)ampPWM);
 }
 
@@ -178,12 +211,12 @@ void updateLCD() {
     lcd.setCursor (0, line); // go to start of line
     switch (line) {
       case 0:
-        dtostrf(analogSmoothed[VoltsChan]/3.28, 5, 1, voltString);
+        dtostrf(analogProcessed[VoltsChan], 5, 1, voltString);
         dtostrf(analogProcessed[AmpsChan], 4, 2, ampString);
         sprintf(lcdLine, " %s V %s A [%s]", voltString, ampString, modeCode[cmailMode]);
         break;
       case 1:
-        sprintf(lcdLine, " #%4d/%-4d %4d sec", cmailCycleNow, cmailCycles, abs(cmailSecRemain));
+        sprintf(lcdLine, " #%4d/%-4d %4d sec", cmailCycleNow, cmailActive.cycles, abs(cmailSecRemain));
         break;
       case 2:
         sprintf(lcdLine, "--------------------");
@@ -191,8 +224,6 @@ void updateLCD() {
       case 3:
         sprintf(lcdLine, "SETUP      RST %s", (cmailMode==OffMode || cmailPause) ? " RUN " : "PAUSE");
     }
-    line = (line+1)%4;
-    lcd.print(lcdLine);
   };
   if (uiScreen == SetupScreen) {
     char voltString[6];
@@ -202,43 +233,43 @@ void updateLCD() {
     switch (line) {
       case 0:
         sel1 = (setupScreenSelector==CyclesSel) ? parens : spaces;
-        sprintf(lcdLine, "  %c%4d%c Cycles [%s]", sel1[0], cmailCycles_tmp, sel1[1], modeCode[cmailMode]);
+        sprintf(lcdLine, "  %c%4d%c Cycles [%s]", sel1[0], cmailTemp.cycles, sel1[1], modeCode[cmailMode]);
         break;
      case 1:
-        dtostrf(cmailV1_tmp, 5, 1, voltString);
+        dtostrf(cmailTemp.v1, 5, 1, voltString);
         sel1 = (setupScreenSelector==V1Sel) ? parens : spaces;
         sel2  = (setupScreenSelector==T1Sel) ? parens : spaces;
-        sprintf(lcdLine, "NS%c%s%cV %c%4d%csec",sel1[0], voltString, sel1[1], sel2[0], cmailT1_tmp, sel2[1]);
+        sprintf(lcdLine, "NS%c%s%cV %c%4d%csec",sel1[0], voltString, sel1[1], sel2[0], cmailTemp.t1, sel2[1]);
         break;
      case 2:
-        dtostrf(cmailV2_tmp, 5, 1, voltString);
+        dtostrf(cmailTemp.v2, 5, 1, voltString);
         sel1 = (setupScreenSelector==V2Sel) ? parens : spaces;
         sel2 = (setupScreenSelector==T2Sel) ? parens : spaces;
-        sprintf(lcdLine, "EW%c%s%cV %c%4d%csec",sel1[0], voltString, sel1[1], sel2[0], cmailT2_tmp, sel2[1]);
+        sprintf(lcdLine, "EW%c%s%cV %c%4d%csec",sel1[0], voltString, sel1[1], sel2[0], cmailTemp.t2, sel2[1]);
         break;
      case 3:
         sprintf(lcdLine, " SEL  ADJ  OK  CANCL");
     }     
-    line = (line+1)%4;
-    lcd.print(lcdLine);
   };
+  line = (line+1)%4;
+  lcd.print(lcdLine);
 }
   
 void handlePanelKnob() {
   if (setupScreenSelector==CyclesSel) {
-    cmailCycles_tmp = int(9999.0*analogProcessed[PotChan]);
+    cmailTemp.cycles= int(9999.0*analogProcessed[PotChan]);
   }
   if (setupScreenSelector==V1Sel) {
-    cmailV1_tmp = 250.0*analogProcessed[PotChan];
+    cmailTemp.v1 = 250.0*analogProcessed[PotChan];
   }
   if (setupScreenSelector==T1Sel) {
-    cmailT1_tmp = int(9999.0*analogProcessed[PotChan]);
+    cmailTemp.t1 = int(9999.0*analogProcessed[PotChan]);
   }
   if (setupScreenSelector==V2Sel) {
-    cmailV2_tmp = 250.0*analogProcessed[PotChan];
+    cmailTemp.v2 = 250.0*analogProcessed[PotChan];
   }
   if (setupScreenSelector==T2Sel) {
-    cmailT2_tmp = int(9999.0*analogProcessed[PotChan]);
+    cmailTemp.t2 = int(9999.0*analogProcessed[PotChan]);
   }
 };
 
@@ -246,7 +277,7 @@ void handlePanelKnob() {
 void handleKeyPress() {
   static int lastKey;
   typedef enum {F4Key=10, F3Key, F2Key, F1Key} KeyName;
-  int key = discreteValue[0];
+  int key = discreteValue[KeysDiscr];
   if (lastKey==-1 && key!=-1) {
     // key down
     if (uiScreen==MainScreen) {
@@ -256,11 +287,7 @@ void handleKeyPress() {
       if (key == SETUP) {
         uiScreen = SetupScreen;
         setupScreenSelector = None;
-        cmailCycles_tmp = cmailCycles;
-        cmailV1_tmp = cmailV1;
-        cmailT1_tmp = cmailT1;
-        cmailV2_tmp = cmailV2;
-        cmailT2_tmp = cmailT2;
+        cmailTemp = cmailActive;
       }
       if (key == RST) {
         cmailCycleNow = 0;
@@ -291,28 +318,29 @@ void handleKeyPress() {
         // initialize pot channel to existing value
         switch (setupScreenSelector) {
           case CyclesSel:
-            analogProcessed[PotChan] = cmailCycles_tmp/9999.0;
-          break;
+            analogProcessed[PotChan] = cmailTemp.cycles/9999.0;
+            break;
           case V1Sel:
-            analogProcessed[PotChan] = cmailV1_tmp/250.0;
-          break;
+            analogProcessed[PotChan] = cmailTemp.v1/250.0;
+            break;
           case T1Sel:
-            analogProcessed[PotChan] = cmailT1_tmp/9999.0;
-          break;
+            analogProcessed[PotChan] = cmailTemp.t1/9999.0;
+            break;
           case V2Sel:
-            analogProcessed[PotChan] = cmailV2_tmp/250.0;
-          break;
+            analogProcessed[PotChan] = cmailTemp.v2/250.0;
+            break;
           case T2Sel:
-            analogProcessed[PotChan] = cmailT2_tmp/9999.0;
-          break;
+            analogProcessed[PotChan] = cmailTemp.t2/9999.0;
+            break;
         }
       }
       if (key == OK) {
-        cmailCycles = cmailCycles_tmp;
-        cmailV1 = cmailV1_tmp;
-        cmailT1 = cmailT1_tmp;
-        cmailV2 = cmailV2_tmp;
-        cmailT2 = cmailT2_tmp;
+        cmailActive = cmailTemp;
+        // save to EEPROM
+        uint8_t* p = (uint8_t*)&cmailActive;
+        for (int i=0; i<sizeof(cmailActive); ++i) {
+          EEPROM.write(i+cmailEEPROMBase, *(p+i));
+        }
         uiScreen = MainScreen;
       }
       if (key == CANCL) {
@@ -335,14 +363,22 @@ void updateCMAIL() {
   switch(cmailMode) {
     case StartMode:
       lastSecondTick = millis();
-      cmailSecRemain = cmailT1;
-      cmailCycleNow = (cmailCycles==0) ? 0 : 1;
-      cmailMode = NSMode;
+      cmailSecRemain = 5;
+      cmailCycleNow = (cmailActive.cycles==0) ? 0 : 1;
+      cmailMode = AmpZeroMode;
       cmailPause = false;
       break;
+    case AmpZeroMode:
+      setpointVolts = 0.0;
+      if (cmailSecRemain == 0) {
+        setAmpsZero();
+        cmailSecRemain = cmailActive.t1;
+        cmailMode = NSMode;
+      }
+      break;
     case NSMode:
-      setpointVolts = cmailPause ? 0.0 : cmailV1;
-      if (cmailSecRemain==0 && cmailCycles>0) {
+      setpointVolts = cmailPause ? 0.0 : cmailActive.v1;
+      if (cmailSecRemain==0 && cmailActive.cycles>0) {
         cmailMode = WaitEWMode;
         cmailSecRemain = 1;
       }
@@ -351,13 +387,13 @@ void updateCMAIL() {
       setpointVolts = 0.0;
       if (cmailSecRemain==0) {
         cmailMode = EWMode;
-        cmailSecRemain = cmailT2;
+        cmailSecRemain = cmailActive.t2;
       }
       break;
     case EWMode:
-      setpointVolts = cmailPause ? 0.0 : cmailV2;
+      setpointVolts = cmailPause ? 0.0 : cmailActive.v2;
       if (cmailSecRemain==0) {
-        if (++cmailCycleNow <= cmailCycles) {
+        if (++cmailCycleNow <= cmailActive.cycles) {
           cmailMode = WaitNSMode;
           cmailSecRemain = 1;
         } else {
@@ -372,7 +408,7 @@ void updateCMAIL() {
       setpointVolts = 0.0;
       if (cmailSecRemain==0) {
         cmailMode = NSMode;
-        cmailSecRemain = cmailT1;
+        cmailSecRemain = cmailActive.t1;
       }
       break;
     case OffMode:
@@ -382,15 +418,16 @@ void updateCMAIL() {
 
 void handleSerialInput() { }
 
-void discretize(float input, int ch) {
-  static int lastVal[numDiscretes];
-  static int debounceCount[numDiscretes];
-  const int debounceLimit[numDiscretes] = { 3, 3 };
+void discretize(float input, AnalogChan ch);
+void discretize(float input, AnalogChan ch) {
+  static int lastVal[NUM_DISCRETES];
+  static int debounceCount[NUM_DISCRETES];
+  const int debounceLimit[NUM_DISCRETES] = { 3, 3 };
   const int numKeys = 14;
   const float keyVals[numKeys] = 
     { 223., 276., 329., 381., 433., 485., 537., 588., 640., 691., 794., 845., 899., 950. };
   //   M1    M2    M3    M4    M5    M6    M7    M8    M9   M10    F4    F3    F2    F1
-  if (ch == 0) {
+  if (ch == KeysChan) {
     int k = -1;
     for (int i=0; i<numKeys; ++i) {
       if (abs(input-keyVals[i])<15.0) {
@@ -408,10 +445,25 @@ void discretize(float input, int ch) {
       debounceCount[ch] = debounceLimit[ch];
     }
   }
-  // if (ch == 1) ...
+  // if (ch == StatusChan) ...
 }
 
-void linearize(float input, int ch) { };
+void slopeIntercept(float input, AnalogChan ch);
+void slopeIntercept(float input, AnalogChan ch) {
+  for (SIParameters* p=siParameters; (p-siParameters)<NUM_SLOPE_INTERCEPTS; ++p) {
+    if (p->chan == ch) {
+      float val = p->slope*input + p->intercept;
+      if (val<0.0) { val = 0.0; }
+      analogProcessed[ch] = val;
+      return;
+    }
+  }
+};
+
+void setAmpsZero() {
+  SIParameters* p=&siParameters[AmpsSI];
+  p->intercept = -p->slope*analogSmoothed[AmpsChan];
+}
 
 void analogSmooth(AnalogChan ch, int in);
 void analogSmooth(AnalogChan ch, int in) {
@@ -432,17 +484,12 @@ void readAnalogInputs() {
       analogSmooth(inChan, rawAnalog);
       int proc = processVal[inChan];
       switch (proc) {
-        case Discrete0:
-        case Discrete1:
-          discretize(analogSmoothed[inChan], proc-Discrete0);
+        case Discrete:
+          discretize(analogSmoothed[inChan], inChan);
           break;
-        case Linearize0:
-
-          linearize(analogSmoothed[inChan], proc-Linearize0);
+        case SlopeIntercept:
+          slopeIntercept(analogSmoothed[inChan], inChan);
           break;
-        case Linearize1: // amps sense
-          analogProcessed[inChan] = (analogSmoothed[inChan]-52.)/180.;
-          if (analogProcessed[inChan]<0.0) { analogProcessed[inChan] = 0.0; }
         case PotProc:
           deltaPot = (analogSmoothed[PotChan]-lastPot)/1024.;
           d = abs(deltaPot);
