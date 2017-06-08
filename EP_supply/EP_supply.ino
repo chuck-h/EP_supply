@@ -83,7 +83,7 @@ const unsigned long analogReadInterval = 50; // millisec between analog updates
 typedef enum  { NoProc, PotProc, Discrete, SlopeIntercept } ProcessType;
 typedef enum              {PotChan=0, KeysChan, StatusChan, VoltsChan, AmpsChan, RemoteChan, ANALOG_CHANS} AnalogChan;
 const uint8_t analogPin[] = { A0,      A5,        A4,        A2,         A1,       A3 };
-const float   smoothingK[]= { 0.5,     0.5,       0.5,       0.1,        0.1,      0.1};
+const float   smoothingK[]= { 0.5,     0.5,       0.5,       0.05,        0.1,      0.1};
 const int8_t  processVal[]= { PotProc,Discrete,Discrete,SlopeIntercept,SlopeIntercept,SlopeIntercept};
 float    analogSmoothed[ANALOG_CHANS];
 float    analogProcessed[ANALOG_CHANS];
@@ -197,7 +197,7 @@ void updateOutputs() {
   float voltPWM = applyCal(setpointVolts, VoltsPWMCal);
   analogWrite16(outputPin[VoltCmd], (uint16_t)voltPWM);
   analogWrite(outputPin[OVoltCmd], 250);
-  const float ampsLimit=0.3;
+  const float ampsLimit=0.4;
   float ampPWM = applyCal(ampsLimit, AmpsPWMCal);
   analogWrite16(outputPin[AmpCmd], (uint16_t)ampPWM);
 }
@@ -420,29 +420,42 @@ void handleSerialInput() { }
 
 void discretize(float input, AnalogChan ch);
 void discretize(float input, AnalogChan ch) {
-  static int lastVal[NUM_DISCRETES];
-  static int debounceCount[NUM_DISCRETES];
-  const int debounceLimit[NUM_DISCRETES] = { 3, 3 };
+  static struct DiscreteType {
+    int lastVal;
+    int debounceCount;
+    int debounceLimit;
+    float window;
+    AnalogChan ch;
+  } discretes[NUM_DISCRETES] = { { 0, 0, 3, 15.0, KeysChan }, { 0, 0, 3, 50.0, StatusChan } };
+
   const int numKeys = 14;
   const float keyVals[numKeys] = 
     { 223., 276., 329., 381., 433., 485., 537., 588., 640., 691., 794., 845., 899., 950. };
   //   M1    M2    M3    M4    M5    M6    M7    M8    M9   M10    F4    F3    F2    F1
+  int discreteIndex = -1;
+  for (discreteIndex=0; discreteIndex<NUM_DISCRETES; ++discreteIndex) {
+    if (discretes[discreteIndex].ch == ch) {
+      break;
+    }
+  }
+  if (discreteIndex < 0) {return; }
+  DiscreteType* d = &discretes[discreteIndex];
   if (ch == KeysChan) {
     int k = -1;
     for (int i=0; i<numKeys; ++i) {
-      if (abs(input-keyVals[i])<15.0) {
+      if (abs(input-keyVals[i]) < d->window) {
         k = i;
         break;
       }
     }
-    if (k==lastVal[ch]) {
-      if (--debounceCount[ch] == 0) {
-        discreteValue[ch] = k;
+    if (k==d->lastVal) {
+      if (--(d->debounceCount) == 0) {
+        discreteValue[discreteIndex] = k;
       }
     }
     else {
-      lastVal[ch] = k;
-      debounceCount[ch] = debounceLimit[ch];
+      d->lastVal = k;
+      d->debounceCount = d->debounceLimit;
     }
   }
   // if (ch == StatusChan) ...
@@ -467,6 +480,10 @@ void setAmpsZero() {
 
 void analogSmooth(AnalogChan ch, int in);
 void analogSmooth(AnalogChan ch, int in) {
+  if (abs(in-analogSmoothed[ch]) > 5) {
+    analogSmoothed[ch] = in; // nonlinear filter
+    return;
+  }
   analogSmoothed[ch] *= (1.0 - smoothingK[ch]);
   analogSmoothed[ch] += smoothingK[ch]*(float)in;
 }
@@ -474,7 +491,8 @@ void analogSmooth(AnalogChan ch, int in) {
 void readAnalogInputs() {
   static unsigned long last_read_time = 0;
   const float PotVirtualTurns = 100.0;
-  float deltaPot, d, t;
+  float deltaPot, absDelta, trialBoost, t;
+  static float potSpeedBoost = 0.0;
   if (millis()-last_read_time > analogReadInterval) {
     last_read_time = millis();
     float lastPot = analogSmoothed[PotChan];
@@ -492,9 +510,14 @@ void readAnalogInputs() {
           break;
         case PotProc:
           deltaPot = (analogSmoothed[PotChan]-lastPot)/1024.;
-          d = abs(deltaPot);
-          if (d<0.001) { deltaPot = 0.0; }  // noise reduction
-          if (d>0.02) { deltaPot *= (d/0.02)*(d/0.02)*(d/0.02); } // 3rd power ballistics
+          absDelta = abs(deltaPot);
+          if (absDelta<0.001) { deltaPot = 0.0; }  // noise reduction
+          if (absDelta>0.02) {
+            trialBoost = 5.0*(absDelta/0.02)*(absDelta/0.02) - 1.0; //  ballistics
+            if (trialBoost > potSpeedBoost) { potSpeedBoost = trialBoost; }
+          }
+          deltaPot *= 1.0 + potSpeedBoost;
+          potSpeedBoost *= 0.9;
           t = analogProcessed[PotChan] + deltaPot/PotVirtualTurns;
           if (t<0.0) { t = 0.0; }
           if (t>1.0) { t = 1.0; }
