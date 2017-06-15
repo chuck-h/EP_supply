@@ -11,21 +11,21 @@
 // only for use in a Volteq product.
 
 // external 15-pin interface connector
-//   pin 1  - MOSI
-//       2  - MISO
-//       3  - SS
-//       4  - SCK
-//       5  - 
-//       6  - +5V
-//       7  - +12V
-//       8  - GND (Main supply output negative)
-//       9  - D4  (polarity relay in sample firmware)
-//      10  - IO13
-//      11  - IO12/A11
-//      12  - D5
-//      13  - D6/A7
-//      14  - RX
-//      15  - TX
+//   pin 8(1)  - MOSI
+//       7(2)  - MISO
+//       6(3)  - SS
+//       5(4)  - SCK
+//       4(5)  - 
+//       3(6)  - +5V
+//       2(7)  - +12V
+//       1(8)  - GND (Main supply output negative)
+//      15(9)  - D4  (polarity relay in sample firmware)
+//      14(10) - IO13
+//      13(11) - IO12/A11
+//      12(12) - D5
+//      11(13) - D6/A7
+//      10(14) - RX
+//       9(15) - TX
 
 
 #include <EEPROM.h>
@@ -50,7 +50,7 @@
 LiquidCrystal_I2C lcd(I2C_ADDR, En_pin, Rw_pin, Rs_pin, D4_pin, D5_pin, D6_pin, D7_pin);
 
 typedef enum                          {AmpCmd, VoltCmd, OVoltCmd, EnableOut, NSOut, EWOut, NUM_OUT_PINS} OutPinType;
-const uint8_t outputPin[NUM_OUT_PINS] = {10,      9,       11,        7,        5,     6 }; 
+const uint8_t outputPin[NUM_OUT_PINS] = {10,      9,       11,        7,        4,     5 }; 
 
 /* Configure digital pins 9 and 10 as 16-bit PWM OutputStatuss. */
 void setupPWM16() {
@@ -192,8 +192,8 @@ float applyCal(float input, CalType c) {
 
 void updateOutputs() {
   digitalWrite(outputPin[EnableOut], (cmailMode==OffMode) ? LOW : HIGH);
-  digitalWrite(outputPin[NSOut], (cmailMode==NSMode) ? HIGH : LOW);
-  digitalWrite(outputPin[EWOut], (cmailMode==EWMode) ? HIGH : LOW);
+  digitalWrite(outputPin[NSOut], (cmailMode==NSMode && !cmailPause) ? HIGH : LOW);
+  digitalWrite(outputPin[EWOut], (cmailMode==EWMode && !cmailPause) ? HIGH : LOW);
   float voltPWM = applyCal(setpointVolts, VoltsPWMCal);
   analogWrite16(outputPin[VoltCmd], (uint16_t)voltPWM);
   analogWrite(outputPin[OVoltCmd], 250);
