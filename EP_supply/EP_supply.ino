@@ -19,11 +19,11 @@
 //       3(6)  - +5V
 //       2(7)  - +12V
 //       1(8)  - GND (Main supply output negative)
-//      15(9)  - D4  (polarity relay in sample firmware)
+//      15(9)  - D4  (NS relay)
 //      14(10) - IO13
-//      13(11) - IO12/A11
-//      12(12) - D5
-//      11(13) - D6/A7
+//      13(11) - IO12/A11 (Ground fault signal)
+//      12(12) - D5  (EW relay)
+//      11(13) - D6/A7 (Ground fault reference)
 //      10(14) - RX
 //       9(15) - TX
 
@@ -75,16 +75,16 @@ void analogWrite16(uint8_t pin, uint16_t val) //Control function for PWM 9 & 10
 
 enum UiScreen {MainScreen, SetupScreen, ParamScreen} uiScreen;
 
-enum {OffMode, StartMode, AmpZeroMode, WaitNSMode, WaitEWMode, NSMode, EWMode, TOTAL_MODES} cmailMode;
-char modeCode[TOTAL_MODES][3] = {"--", "--", "az", "..", "..", "NS", "EW"};
+enum {OffMode, StartMode, AZWaitMode, AmpZeroMode, WaitNSMode, WaitEWMode, NSMode, EWMode, TOTAL_MODES} cmailMode;
+char modeCode[TOTAL_MODES][3] = {"--", "--", "az", "az", "..", "..", "NS", "EW"};
 
 // Analog input & processing
 const unsigned long analogReadInterval = 50; // millisec between analog updates
 typedef enum  { NoProc, PotProc, Discrete, SlopeIntercept } ProcessType;
-typedef enum              {PotChan=0, KeysChan, StatusChan, VoltsChan, AmpsChan, RemoteChan, ANALOG_CHANS} AnalogChan;
-const uint8_t analogPin[] = { A0,      A5,        A4,        A2,         A1,       A3 };
-const float   smoothingK[]= { 0.5,     0.5,       0.5,       0.05,        0.1,      0.1};
-const int8_t  processVal[]= { PotProc,Discrete,Discrete,SlopeIntercept,SlopeIntercept,SlopeIntercept};
+typedef enum              {PotChan=0, KeysChan, StatusChan, VoltsChan, AmpsChan, RemoteChan, GFSigChan, GFRefChan, ANALOG_CHANS} AnalogChan;
+const uint8_t analogPin[] = { A0,      A5,        A4,        A2,         A1,       A3,         A11,      A7  };
+const float   smoothingK[]= { 0.5,     0.5,       0.5,       0.05,        0.1,      0.1,        0.2,     0.2 };
+const int8_t  processVal[]= { PotProc,Discrete,Discrete,SlopeIntercept,SlopeIntercept,SlopeIntercept, NoProc, NoProc};
 float    analogSmoothed[ANALOG_CHANS];
 float    analogProcessed[ANALOG_CHANS];
 
@@ -97,7 +97,7 @@ struct SIParameters {
   AnalogChan chan;
 };
 struct SIParameters siParameters[NUM_SLOPE_INTERCEPTS] = {
-  {0.305, 0., VoltsChan}, { 0.0055, -0.29, AmpsChan}, {0.305, 0., RemoteChan} }; 
+  {0.305, 0., VoltsChan}, { 0.0045, -0.29, AmpsChan}, {0.305, 0., RemoteChan} }; 
 
 typedef enum     {AmpsPWMCal, VoltsPWMCal, OVoltsPWMCal, NUM_CALS } CalType;
 const int CAL_COEFFS = 4;
@@ -116,6 +116,9 @@ const int cmailEEPROMBase = 0;
 // CMAIL running values
 int cmailCycleNow, cmailSecRemain;
 bool cmailPause;
+
+float gfZero;
+bool gfTrip;
 
 typedef enum {None, CyclesSel, V1Sel, T1Sel, V2Sel, T2Sel} SetupScreenSelector;
 SetupScreenSelector setupScreenSelector;
@@ -173,6 +176,7 @@ void loop()
   handleKeyPress();
   handlePanelKnob();
   updateCMAIL();
+  checkGF();
 
   updateOutputs();
   updateLCD();
@@ -192,12 +196,12 @@ float applyCal(float input, CalType c) {
 
 void updateOutputs() {
   digitalWrite(outputPin[EnableOut], (cmailMode==OffMode) ? LOW : HIGH);
-  digitalWrite(outputPin[NSOut], (cmailMode==NSMode && !cmailPause) ? HIGH : LOW);
+  digitalWrite(outputPin[NSOut], ((cmailMode==NSMode || cmailMode==AmpZeroMode) && !cmailPause) ? HIGH : LOW);
   digitalWrite(outputPin[EWOut], (cmailMode==EWMode && !cmailPause) ? HIGH : LOW);
   float voltPWM = applyCal(setpointVolts, VoltsPWMCal);
   analogWrite16(outputPin[VoltCmd], (uint16_t)voltPWM);
   analogWrite(outputPin[OVoltCmd], 250);
-  const float ampsLimit=0.4;
+  const float ampsLimit=0.5;
   float ampPWM = applyCal(ampsLimit, AmpsPWMCal);
   analogWrite16(outputPin[AmpCmd], (uint16_t)ampPWM);
 }
@@ -219,7 +223,7 @@ void updateLCD() {
         sprintf(lcdLine, " #%4d/%-4d %4d sec", cmailCycleNow, cmailActive.cycles, abs(cmailSecRemain));
         break;
       case 2:
-        sprintf(lcdLine, "--------------------");
+        sprintf(lcdLine, "---%s%s----", gfTrip ? "GFault " : "-------", cmailPause ? "PAUSED" : "------");
         break;
       case 3:
         sprintf(lcdLine, "SETUP      RST %s", (cmailMode==OffMode || cmailPause) ? " RUN " : "PAUSE");
@@ -254,7 +258,23 @@ void updateLCD() {
   line = (line+1)%4;
   lcd.print(lcdLine);
 }
-  
+
+void checkGF() {
+  const float gfThresh = 5.;
+  const int gfTimeoutMsec = 250;
+  static unsigned long gfTimeoutStart;
+  if ((cmailMode==NSMode || cmailMode == EWMode) && !cmailPause) {
+    if( (analogProcessed[GFSigChan]-analogProcessed[GFRefChan] - gfZero) > gfThresh) {
+      if ((millis() - gfTimeoutStart) > gfTimeoutMsec) {
+        gfTrip = true;
+        cmailPause = true;
+      }
+    }
+    else {
+      gfTimeoutStart = millis();
+    }
+  }
+}
 void handlePanelKnob() {
   if (setupScreenSelector==CyclesSel) {
     cmailTemp.cycles= int(9999.0*analogProcessed[PotChan]);
@@ -300,6 +320,7 @@ void handleKeyPress() {
           cmailMode = StartMode;
         } else if (cmailPause) {
           cmailPause = false;
+          gfTrip = false;
         } else {
           cmailPause = true;
         }
@@ -365,13 +386,22 @@ void updateCMAIL() {
       lastSecondTick = millis();
       cmailSecRemain = 5;
       cmailCycleNow = (cmailActive.cycles==0) ? 0 : 1;
-      cmailMode = AmpZeroMode;
+      cmailMode = AZWaitMode;
       cmailPause = false;
+      gfTrip = false;
+      break;
+    case AZWaitMode:
+      setpointVolts = 0.0;
+      if (cmailSecRemain == 0) {
+        cmailSecRemain = 1;
+        cmailMode = AmpZeroMode;
+      }
       break;
     case AmpZeroMode:
       setpointVolts = 0.0;
       if (cmailSecRemain == 0) {
         setAmpsZero();
+        gfZero = analogProcessed[GFSigChan]-analogProcessed[GFRefChan];
         cmailSecRemain = cmailActive.t1;
         cmailMode = NSMode;
       }
@@ -477,6 +507,8 @@ void setAmpsZero() {
   SIParameters* p=&siParameters[AmpsSI];
   p->intercept = -p->slope*analogSmoothed[AmpsChan];
 }
+
+
 
 void analogSmooth(AnalogChan ch, int in);
 void analogSmooth(AnalogChan ch, int in) {
