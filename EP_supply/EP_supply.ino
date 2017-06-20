@@ -75,7 +75,7 @@ void analogWrite16(uint8_t pin, uint16_t val) //Control function for PWM 9 & 10
 
 void checkGF(bool reset = false);
 
-enum UiScreen {MainScreen, SetupScreen, ParamScreen} uiScreen;
+enum UiScreen {SplashScreen, MainScreen, SetupScreen, ParamScreen} uiScreen;
 
 enum {OffMode, StartMode, AZWaitMode, AmpZeroMode, WaitNSMode, WaitEWMode, NSMode, EWMode, TOTAL_MODES} cmailMode;
 char modeCode[TOTAL_MODES][3] = {"--", "--", "az", "az", "..", "..", "NS", "EW"};
@@ -161,7 +161,7 @@ void setup()
   }
 
   cmailMode = OffMode;
-  uiScreen = MainScreen;
+  uiScreen = SplashScreen;
 
 }
 
@@ -179,6 +179,7 @@ void loop()
   handlePanelKnob();
   updateCMAIL();
   checkGF();
+  handleSplash();
 
   updateOutputs();
   updateLCD();
@@ -196,6 +197,11 @@ float applyCal(float input, CalType c) {
   return rv;
 }
 
+void handleSplash() {
+  if (uiScreen == SplashScreen && millis()>6000) {
+    uiScreen = MainScreen;
+  }
+}
 void updateOutputs() {
   digitalWrite(outputPin[EnableOut], (cmailMode==OffMode) ? LOW : HIGH);
   digitalWrite(outputPin[NSOut], ((cmailMode==NSMode || cmailMode==AmpZeroMode) && !cmailPause) ? HIGH : LOW);
@@ -256,6 +262,22 @@ void updateLCD() {
      case 3:
         sprintf(lcdLine, " SEL       OK  CANCL");
         // future parameter adjustment screen: sprintf(lcdLine, " SEL  ADJ  OK  CANCL");
+    }     
+  };
+  if (uiScreen == SplashScreen) {
+    lcd.setCursor (0, line); // go to start of line
+    switch (line) {
+      case 0:
+        sprintf(lcdLine, "   DC Power Supply  ");
+        break;
+     case 1:
+        sprintf(lcdLine, "  Dual Axis Control ");
+        break;
+     case 2:
+        sprintf(lcdLine, "   (use with ES-8)  ");
+        break;
+     case 3:
+        sprintf(lcdLine, "  firmware ver 1.0  ");
     }     
   };
   line = (line+1)%4;
