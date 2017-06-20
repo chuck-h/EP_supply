@@ -73,6 +73,8 @@ void analogWrite16(uint8_t pin, uint16_t val) //Control function for PWM 9 & 10
   }
 }
 
+void checkGF(bool reset = false);
+
 enum UiScreen {MainScreen, SetupScreen, ParamScreen} uiScreen;
 
 enum {OffMode, StartMode, AZWaitMode, AmpZeroMode, WaitNSMode, WaitEWMode, NSMode, EWMode, TOTAL_MODES} cmailMode;
@@ -97,7 +99,7 @@ struct SIParameters {
   AnalogChan chan;
 };
 struct SIParameters siParameters[NUM_SLOPE_INTERCEPTS] = {
-  {0.305, 0., VoltsChan}, { 0.0045, -0.29, AmpsChan}, {0.305, 0., RemoteChan} }; 
+  {0.298, 0., VoltsChan}, { 0.0045, -0.29, AmpsChan}, {0.305, 0., RemoteChan} }; 
 
 typedef enum     {AmpsPWMCal, VoltsPWMCal, OVoltsPWMCal, NUM_CALS } CalType;
 const int CAL_COEFFS = 4;
@@ -252,17 +254,23 @@ void updateLCD() {
         sprintf(lcdLine, "EW%c%s%cV %c%4d%csec",sel1[0], voltString, sel1[1], sel2[0], cmailTemp.t2, sel2[1]);
         break;
      case 3:
-        sprintf(lcdLine, " SEL  ADJ  OK  CANCL");
+        sprintf(lcdLine, " SEL       OK  CANCL");
+        // future parameter adjustment screen: sprintf(lcdLine, " SEL  ADJ  OK  CANCL");
     }     
   };
   line = (line+1)%4;
   lcd.print(lcdLine);
 }
 
-void checkGF() {
-  const float gfThresh = 5.;
+
+void checkGF(bool reset) {
+  const float gfThresh = 8;  // approx 50 ma; much less gives nuisance trips
   const int gfTimeoutMsec = 250;
   static unsigned long gfTimeoutStart;
+  if (reset) {
+    gfTimeoutStart = millis();
+    gfTrip = false;
+  }
   if ((cmailMode==NSMode || cmailMode == EWMode) && !cmailPause) {
     if( (analogProcessed[GFSigChan]-analogProcessed[GFRefChan] - gfZero) > gfThresh) {
       if ((millis() - gfTimeoutStart) > gfTimeoutMsec) {
@@ -314,13 +322,15 @@ void handleKeyPress() {
         cmailSecRemain = 0;
         setpointVolts = 0.0;
         cmailMode = OffMode;
+        cmailPause = false;
+        checkGF(true);
       }
       if (key == RUN_PAUSE) {
         if (cmailMode==OffMode) {
           cmailMode = StartMode;
         } else if (cmailPause) {
           cmailPause = false;
-          gfTrip = false;
+          checkGF(true);
         } else {
           cmailPause = true;
         }
@@ -402,6 +412,7 @@ void updateCMAIL() {
       if (cmailSecRemain == 0) {
         setAmpsZero();
         gfZero = analogProcessed[GFSigChan]-analogProcessed[GFRefChan];
+        checkGF(true);
         cmailSecRemain = cmailActive.t1;
         cmailMode = NSMode;
       }
@@ -417,6 +428,7 @@ void updateCMAIL() {
       setpointVolts = 0.0;
       if (cmailSecRemain==0) {
         cmailMode = EWMode;
+        checkGF(true);
         cmailSecRemain = cmailActive.t2;
       }
       break;
@@ -438,6 +450,7 @@ void updateCMAIL() {
       setpointVolts = 0.0;
       if (cmailSecRemain==0) {
         cmailMode = NSMode;
+        checkGF(true);
         cmailSecRemain = cmailActive.t1;
       }
       break;
