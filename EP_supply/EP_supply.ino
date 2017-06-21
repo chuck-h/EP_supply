@@ -435,7 +435,7 @@ void updateCMAIL() {
         setAmpsZero();
         gfZero = analogProcessed[GFSigChan]-analogProcessed[GFRefChan];
         checkGF(true);
-        cmailSecRemain = cmailActive.t1;
+        cmailSecRemain = (cmailActive.cycles==0) ? 0 : cmailActive.t1;
         cmailMode = NSMode;
       }
       break;
